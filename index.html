@@ -17,599 +17,448 @@
                 height: 100%;
             }
     </style>
-    <script src="https://ajax.aspnetcdn.com/ajax/jQuery/jquery-3.2.1.min.js"></script>
 </head>
 <body>
     <canvas></canvas>
     <div id="info"></div>
     <script>
-            window.requestAnimationFrame = window.requestAnimationFrame || (function ()
-            {
-                return window.webkitRequestAnimationFrame ||
-                    window.mozRequestAnimationFrame ||
-                    window.oRequestAnimationFrame ||
-                    window.msRequestAnimationFrame ||
-                    function (callback, element)
-                    {
-                        window.setTimeout(callback, 1000 / 60);
-                    };
-            })();
-            var canvas
-                , gl
-                , buffer
-                , vertex_shader, fragment_shader, heightfield_shader, gravity_shader, caustics_fs, caustics_vs
-                , heightProgram
-                , renderProgram
-                , vertex_position = 0
-                , timeLocation
-                , resolutionLocation
-                , frame
-                , parameters = {
-                    start_time: new Date().getTime()
-                    , time: 0
-                    , screenWidth: 0
-                    , screenHeight: 0
-                };
+        (async function () {
+            const canvas = document.querySelector('canvas');
+            const info = document.getElementById('info');
 
-            start();
-
-            function read(textfile, id, type)
-            {
-                return new Promise((resolve, reject) =>
-                {
-                    var request = new XMLHttpRequest();
-                    request.open('GET', textfile, true);
-                    request.onload = () => resolve((id, type) => this.show);
-                    request.onerror = () => reject(request.statusText);
-                    request.send()
-                })
+            if (!navigator.gpu) {
+                info.textContent = 'WebGPU not supported in this browser.';
+                return;
             }
 
-            function show(id, type)
-            {
-                var script = document.createElement('script')
-                script.id = id
-                script.type = type
-                script.textContent = this.response;
-                document.body.appendChild(script)
+            const shaderPaths = {
+                height: 'shaders/heightfield.wgsl',
+                gravity: 'shaders/gravity.wgsl',
+                render: 'shaders/render.wgsl',
+                caustics: 'shaders/caustics.wgsl'
+            };
+
+            const shaders = {};
+            await Promise.all(Object.keys(shaderPaths).map(async (key) => {
+                const res = await fetch(shaderPaths[key]);
+                shaders[key] = await res.text();
+            }));
+
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+            const context = canvas.getContext('webgpu');
+            const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+            const simResolution = 128;
+            const causticsResolution = 512;
+
+            const quadVertices = new Float32Array([
+                -1, -1, 1, -1, -1, 1,
+                1, -1, 1, 1, -1, 1
+            ]);
+            const quadBuffer = device.createBuffer({
+                size: quadVertices.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+            });
+            device.queue.writeBuffer(quadBuffer, 0, quadVertices);
+
+            function createLightWaveVertices(width = 256, height = 256) {
+                const verts = [];
+                for (let i = 0; i < height; i++) {
+                    for (let j = 0; j < width; j++) {
+                        const v1x = (i / height) * 2 - 1;
+                        const v1y = (j / width) * 2 - 1;
+                        const v2x = ((i + 1) / height) * 2 - 1;
+                        const v2y = ((j + 1) / width) * 2 - 1;
+                        verts.push(v1x, v1y, v1x, v2y, v2x, v2y);
+                        verts.push(v1x, v1y, v2x, v2y, v2x, v1y);
+                    }
+                }
+                return new Float32Array(verts);
             }
 
-            function start()
-            {
-                var ajaxcalls = [];
-                ajaxcalls.push($.get('vs/render.c', function(data) { vertex_shader = data; }));
-                ajaxcalls.push($.get('fs/render.c', function(data) { fragment_shader = data; }));
-                ajaxcalls.push($.get('vs/caustics.c', function(data) { caustics_vs = data; }));
-                ajaxcalls.push($.get('fs/caustics.c', function(data) { caustics_fs = data; }));
-                ajaxcalls.push($.get('fs/heightfield.c', function(data) { heightfield_shader = data; }));
-                ajaxcalls.push($.get('fs/gravity.c', function(data) { gravity_shader = data; }));
-                $.when(...ajaxcalls).done(function() 
-                {
-                    init();
-                    animate();
+            const lightWaveVertices = createLightWaveVertices();
+            const lightWaveBuffer = device.createBuffer({
+                size: lightWaveVertices.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+            });
+            device.queue.writeBuffer(lightWaveBuffer, 0, lightWaveVertices);
+
+            const uploadTextureUsage = GPUTextureUsage.TEXTURE_BINDING |
+                GPUTextureUsage.COPY_DST |
+                GPUTextureUsage.RENDER_ATTACHMENT;
+
+            function createTexture(size) {
+                return device.createTexture({
+                    size: [size, size, 1],
+                    format: 'rgba16float',
+                    usage: uploadTextureUsage
                 });
             }
 
-            function init()
-            {
-                canvas = document.querySelector('canvas');
+            const heightTexture0 = createTexture(simResolution);
+            const heightTexture1 = createTexture(simResolution);
+            const causticsTexture = device.createTexture({
+                size: [causticsResolution, causticsResolution, 1],
+                format: 'rgba16float',
+                usage: uploadTextureUsage
+            });
 
-                // Initialise WebGL
-                try
-                {
-                    gl = canvas.getContext('experimental-webgl');
-                } catch (error) {}
-
-                if (!gl)
-                {
-                    throw "cannot create webgl context";
-                }
-
-                // Extensions
-                gl.getExtension('OES_texture_float');
-                gl.getExtension('OES_texture_float_linear');
-                gl.getExtension('OES_standard_derivatives');
-
-                // Create Vertex buffer (2 triangles)
-                buffer = gl.createBuffer();
-                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0]), gl.STATIC_DRAW);
-
-                // Create Buffer for the Light Wavefront 
-                createLightWaveBuffer();
-
-                // Create Frame Buffer for storing the height field
-                initFrameBuffers();
-
-                // Create Programs
-                initHeightProgram();
-                initGravityProgram();
-                initCausticsProgram();
-                initRenderProgram();
-
-                wallTexture = loadTexture(gl, "black.jpg");
-                skyTexture = loadTexture(gl, "tiles.jpg");
-
-                canvas.onmousedown = handleMouseDown;
-                canvas.onmousemove = handleMouseMove;
-                canvas.onmouseup = handleMouseUp;
-                canvas.onwheel = handleWheelScroll;
-                canvas.ontouchstart = ((e) => handleMouseDown(e.touches[0]));
-                canvas.ontouchend = ((e) => handleMouseUp(e.touches[0]));
-                canvas.ontouchmove = ((e) => 
-                    {
-                        handleMouseMove(e.touches[0]);
-                        e.preventDefault();
-                    });
-
-                mousedown = false;
-                mousemove = false;
-                mouseclicked = false;
-                mouseDownX = null;
-                mouseDownY = null;
-                eyeCoordinate = {
-                    radius : 4,
-                    phi : 0.785, 
-                    theta : 0.785
-                };
-            }
-
-            function createLightWaveBuffer()
-            {
-                // Resolution
-                var width = 256;
-                var height = 256;
-                lightWaveVertices = [];
-                
-                for (i = 0; i < height; i++)
-                {
-                    for (j = 0; j < width; j++)
-                    {
-                        var v1x = (i/height)*2 - 1;
-                        var v1y = (j/width)*2 - 1;
-                        var v2x = ((i+1)/height)*2 - 1;
-                        var v2y = ((j+1)/width)*2 - 1;
-                        // Triangle 1
-                        lightWaveVertices.push.apply(lightWaveVertices, [v1x, v1y]);
-                        lightWaveVertices.push.apply(lightWaveVertices, [v1x, v2y]);
-                        lightWaveVertices.push.apply(lightWaveVertices, [v2x, v2y]);
-                        // Triangle 2 
-                        lightWaveVertices.push.apply(lightWaveVertices, [v1x, v1y]);
-                        lightWaveVertices.push.apply(lightWaveVertices, [v2x, v2y]);
-                        lightWaveVertices.push.apply(lightWaveVertices, [v2x, v1y]);
+            function createInitialHeightData(size) {
+                const data = new Float32Array(size * size * 4);
+                for (let i = 0; i < size; i++) {
+                    for (let j = 0; j < size; j++) {
+                        const x = i / (size * 0.5) - 1.0;
+                        const z = j / (size * 0.5) - 1.0;
+                        const t = x * x + z * z;
+                        const idx = (i * size + j) * 4;
+                        data[idx] = 0.0;
+                        data[idx + 1] = 0.0;
+                        data[idx + 2] = t < 0.3 ? 0.09 * Math.sin(50.0 * t) : 0.0;
+                        data[idx + 3] = 0.0;
                     }
                 }
-
-
-                lightWaveBuffer = gl.createBuffer();
-                gl.bindBuffer(gl.ARRAY_BUFFER, lightWaveBuffer);
-                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lightWaveVertices), gl.STATIC_DRAW);
+                return data;
             }
 
-            function initCausticsProgram()
-            {
-                causticsProgram = createProgram(caustics_vs, caustics_fs);
-                causticsUniform = {
-                    timeLocation : gl.getUniformLocation(causticsProgram, 'time')
-                    ,heightSamplerLocation : gl.getUniformLocation(causticsProgram, 'heightSampler')
-                    ,light1 : gl.getUniformLocation(causticsProgram, 'light1')
-                    ,light2 : gl.getUniformLocation(causticsProgram, 'light2')
-                    ,light3 : gl.getUniformLocation(causticsProgram, 'light3')
-                }
-            }
+            const initialHeight = createInitialHeightData(simResolution);
+            const bytesPerRow = simResolution * 8;
+            [heightTexture0, heightTexture1].forEach((texture) => {
+                device.queue.writeTexture(
+                    { texture },
+                    initialHeight,
+                    { bytesPerRow, rowsPerImage: simResolution },
+                    { width: simResolution, height: simResolution, depthOrArrayLayers: 1 }
+                );
+            });
 
-            function initGravityProgram()
-            {
-                gravityProgram = createProgram(vertex_shader, gravity_shader);
-                gravityUniforms = {
-                    resolutionLocation : gl.getUniformLocation(gravityProgram, 'resolution')
-                    ,samplerLocation : gl.getUniformLocation(gravityProgram, 'sampler')
-                };
-            }
+            const causticsClear = new Float32Array(causticsResolution * causticsResolution * 4);
+            device.queue.writeTexture(
+                { texture: causticsTexture },
+                causticsClear,
+                { bytesPerRow: causticsResolution * 8, rowsPerImage: causticsResolution },
+                { width: causticsResolution, height: causticsResolution, depthOrArrayLayers: 1 }
+            );
 
-            function initRenderProgram()
-            {
-                renderProgram = createProgram(vertex_shader, fragment_shader);
-                renderUniforms = {
-                    timeLocation : gl.getUniformLocation(renderProgram, 'time')
-                    ,resolutionLocation : gl.getUniformLocation(renderProgram, 'resolution')
-                    ,heightSamplerLocation : gl.getUniformLocation(renderProgram, 'heightSampler')
-                    ,wallSamplerLocation : gl.getUniformLocation(renderProgram, 'wallSampler')
-                    ,skySamplerLocation : gl.getUniformLocation(renderProgram, 'skySampler')
-                    ,causticsSamperLocation : gl.getUniformLocation(renderProgram, 'causticsSampler')
-                    ,eyeCoordinate : gl.getUniformLocation(renderProgram, 'eyeCoordinate')
-                    ,light1 : gl.getUniformLocation(renderProgram, 'light1')
-                    ,light2 : gl.getUniformLocation(renderProgram, 'light2')
-                    ,light3 : gl.getUniformLocation(renderProgram, 'light3')
-                };
-            }
+            const linearSampler = device.createSampler({
+                magFilter: 'linear',
+                minFilter: 'linear',
+                addressModeU: 'clamp-to-edge',
+                addressModeV: 'clamp-to-edge'
+            });
 
-            function initHeightProgram()
-            {
-                heightProgram = createProgram(vertex_shader, heightfield_shader);
-                heightUniforms = {
-                    timeLocation : gl.getUniformLocation(heightProgram, 'time')
-                    ,resolutionLocation : gl.getUniformLocation(heightProgram, 'resolution')
-                    ,samplerLocation : gl.getUniformLocation(heightProgram, 'sampler')
-                    ,eyeCoordinate : gl.getUniformLocation(heightProgram, 'eyeCoordinate')
-                    ,mouseHit : gl.getUniformLocation(heightProgram, 'mouseHit')
-                    ,mousePos : gl.getUniformLocation(heightProgram, 'mousePos')
-                    ,screenRes : gl.getUniformLocation(heightProgram, 'screenRes')
-                }
-            }
-
-            function initFrameBuffers()
-            {
-                width = 128;
-                height = 128;
-                heightFrameBuffer0 = gl.createFramebuffer();
-                gl.bindFramebuffer(gl.FRAMEBUFFER, heightFrameBuffer0);
-                heightFrameBuffer0.width = width;
-                heightFrameBuffer0.height = height;
-
-                heightTexture0 = loadFloatTexture(gl, width, height);
-                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, heightTexture0, 0);
-                if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE)
-                {
-                    heightFrameBuffer0.width = 512;
-                    heightFrameBuffer0.height = 512;
-                    heightTexture0 = loadFloatTexture(gl, 512, 512, false);
-                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, heightTexture0, 0);
-                }
-
-                heightFrameBuffer1 = gl.createFramebuffer();
-                gl.bindFramebuffer(gl.FRAMEBUFFER, heightFrameBuffer1);
-                heightFrameBuffer1.width = width;
-                heightFrameBuffer1.height = height;
-
-                heightTexture1 = loadFloatTexture(gl, width, height);
-                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, heightTexture1, 0);
-                if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE)
-                {
-                    heightFrameBuffer1.width = 512;
-                    heightFrameBuffer1.height = 512;
-                    heightTexture1 = loadFloatTexture(gl, 512, 512, false);
-                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, heightTexture1, 0);
-                }
-
-                // Caustics Frame Buffer & Texture
-                causticsFrameBuffer = gl.createFramebuffer();
-                gl.bindFramebuffer(gl.FRAMEBUFFER, causticsFrameBuffer);
-                causticsFrameBuffer.width = 512;
-                causticsFrameBuffer.height = 512;
-                causticsTexture = loadEmptyTexture(gl, causticsFrameBuffer);
-                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, causticsTexture, 0);
-                if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE)
-                {
-                    causticsTexture = loadFloatTexture(gl, 512, 512, false);
-                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, causticsTexture, 0);
-                }
-
-                gl.bindTexture(gl.TEXTURE_2D, null);
-                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-                frame = 0;
-            }
-
-            function createProgram(vertex, fragment)
-            {
-                var program = gl.createProgram();
-                var vs = createShader(vertex, gl.VERTEX_SHADER);
-                var fs = createShader('#extension GL_OES_standard_derivatives : enable\n#ifdef GL_ES\nprecision highp float;\n#endif\n\n' + fragment, gl.FRAGMENT_SHADER);
-                if (vs == null || fs == null) return null;
-
-                gl.attachShader(program, vs);
-                gl.attachShader(program, fs);
-                gl.deleteShader(vs);
-                gl.deleteShader(fs);
-                gl.linkProgram(program);
-
-                if (!gl.getProgramParameter(program, gl.LINK_STATUS))
-                {
-                    alert("ERROR:\n" +
-                        "VALIDATE_STATUS: " + gl.getProgramParameter(program, gl.VALIDATE_STATUS) + "\n" +
-                        "ERROR: " + gl.getError() + "\n\n" +
-                        "- Vertex Shader -\n" + vertex + "\n\n" +
-                        "- Fragment Shader -\n" + fragment);
-                    return null;
-                }
-
-                return program;
-            }
-
-            function createShader(src, type)
-            {
-                var shader = gl.createShader(type);
-                gl.shaderSource(shader, src);
-                gl.compileShader(shader);
-                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
-                {
-                    alert((type == gl.VERTEX_SHADER ? "VERTEX" : "FRAGMENT") + " SHADER:\n" + gl.getShaderInfoLog(shader));
-                    return null;
-                }
-                return shader;
-            }
-
-            function loadEmptyTexture(gl, framebuffer, linear=true)
-            {
-                const texture = gl.createTexture();
-                gl.bindTexture(gl.TEXTURE_2D, texture);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, framebuffer.width, framebuffer.height, 0,
-                            gl.RGBA, gl.FLOAT, null);
-
-                //gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, rttFramebuffer.width, rttFramebuffer.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-                //gl.generateMipmap(gl.TEXTURE_2D);
-                
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linear ? gl.LINEAR : gl.NEAREST);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linear ? gl.LINEAR : gl.NEAREST);
-                
+            async function loadTextureFromURL(url) {
+                const res = await fetch(url);
+                const blob = await res.blob();
+                const image = await createImageBitmap(blob);
+                const texture = device.createTexture({
+                    size: [image.width, image.height, 1],
+                    format: 'rgba8unorm',
+                    // Include RENDER_ATTACHMENT because some platforms blit during copyExternalImageToTexture.
+                    usage: uploadTextureUsage
+                });
+                device.queue.copyExternalImageToTexture(
+                    { source: image },
+                    { texture },
+                    [image.width, image.height]
+                );
                 return texture;
             }
 
-            function loadFloatTexture(gl, w, h, linear=true)
-            {
-                const texture = gl.createTexture();
-                gl.bindTexture(gl.TEXTURE_2D, texture);
+            const skyTexture = await loadTextureFromURL('tiles.jpg');
 
-                var heightMap = new Float32Array(w * h * 4);
+            const heightModule = device.createShaderModule({ code: shaders.height });
+            const gravityModule = device.createShaderModule({ code: shaders.gravity });
+            const renderModule = device.createShaderModule({ code: shaders.render });
+            const causticsModule = device.createShaderModule({ code: shaders.caustics });
 
-                for (var i = 0; i < w; i++)
-                {
-                    for (var j = 0; j < h; j++)
-                    {
-                        var x = (i / (h * 0.5)) - 1.0;
-                        var z = (j / (w * 0.5)) - 1.0;
-                        var t = x * x + z * z;
-                        heightMap[(i * w + j) * 4 + 0] = 0.0;
-                        heightMap[(i * w + j) * 4 + 1] = 0.0;
-                        if (t < 0.3)
-                            heightMap[(i * w + j) * 4 + 2] = 0.09 * Math.sin(50.0 * t);
-                        else
-                            heightMap[(i * w + j) * 4 + 2] = 0.0;
-                        heightMap[(i * w + j) * 4 + 3] = 0.0;
-                    }
-                }   
+            const vertexBufferLayout = {
+                arrayStride: 8,
+                attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }]
+            };
 
-                gl.bindTexture(gl.TEXTURE_2D, texture);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, 
-                            gl.RGBA, gl.FLOAT, heightMap);
-                // if (isPowerOf2(w) && isPowerOf2(h)) 
-                // {
-                //     gl.generateMipmap(gl.TEXTURE_2D);
-                // }
-                if (true)
-                {
-                    gl.generateMipmap(gl.TEXTURE_2D);
-                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linear ? gl.LINEAR : gl.NEAREST);
-                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linear ? gl.LINEAR : gl.NEAREST);
+            const heightPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: { module: heightModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+                fragment: {
+                    module: heightModule,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: 'rgba16float' }]
+                },
+                primitive: { topology: 'triangle-list' }
+            });
+
+            const gravityPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: { module: gravityModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+                fragment: {
+                    module: gravityModule,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: 'rgba16float' }]
+                },
+                primitive: { topology: 'triangle-list' }
+            });
+
+            const causticsPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: { module: causticsModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+                fragment: {
+                    module: causticsModule,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: 'rgba16float' }]
+                },
+                primitive: { topology: 'triangle-list' }
+            });
+
+            const renderPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: { module: renderModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+                fragment: {
+                    module: renderModule,
+                    entryPoint: 'fs_main',
+                    targets: [{ format: canvasFormat }]
+                },
+                primitive: { topology: 'triangle-list' }
+            });
+
+            const heightUniformBuffer = device.createBuffer({
+                size: 128,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+            const gravityUniformBuffer = device.createBuffer({
+                size: 32,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+            const causticsUniformBuffer = device.createBuffer({
+                size: 128,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+            const renderUniformBuffer = device.createBuffer({
+                size: 128,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            const heightBindGroup = device.createBindGroup({
+                layout: heightPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: heightUniformBuffer } },
+                    { binding: 1, resource: linearSampler },
+                    { binding: 2, resource: heightTexture1.createView() }
+                ]
+            });
+
+            const gravityBindGroup = device.createBindGroup({
+                layout: gravityPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: gravityUniformBuffer } },
+                    { binding: 1, resource: linearSampler },
+                    { binding: 2, resource: heightTexture0.createView() }
+                ]
+            });
+
+            const causticsBindGroup = device.createBindGroup({
+                layout: causticsPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: causticsUniformBuffer } },
+                    { binding: 1, resource: linearSampler },
+                    { binding: 2, resource: heightTexture1.createView() }
+                ]
+            });
+
+            const renderBindGroup = device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: renderUniformBuffer } },
+                    { binding: 1, resource: linearSampler },
+                    { binding: 2, resource: heightTexture1.createView() },
+                    { binding: 4, resource: causticsTexture.createView() },
+                    { binding: 5, resource: skyTexture.createView() }
+                ]
+            });
+
+            let mouseDown = false;
+            let mouseMoved = false;
+            let mouseClicked = false;
+            let mouseX = 0;
+            let mouseY = 0;
+            const eyeCoordinate = { radius: 4, phi: 0.785, theta: 0.785 };
+            const lights = [
+                [2.0, 2.0, 2.0],
+                [-2.0, 2.0, -2.0],
+                [0.0, 2.0, 0.0]
+            ];
+            const startTime = performance.now();
+
+            function resizeCanvas() {
+                const devicePixelRatio = window.devicePixelRatio || 1;
+                const width = Math.floor(canvas.clientWidth * devicePixelRatio);
+                const height = Math.floor(canvas.clientHeight * devicePixelRatio);
+                if (canvas.width !== width || canvas.height !== height) {
+                    canvas.width = width;
+                    canvas.height = height;
                 }
-                return texture;
+                context.configure({
+                    device,
+                    format: canvasFormat,
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+                    alphaMode: 'opaque'
+                });
+                return { width, height };
             }
 
-            function loadTexture(gl, url)
-            {
-                const texture = gl.createTexture();
-                gl.bindTexture(gl.TEXTURE_2D, texture);
-
-                const level = 0;
-                const internalFormat = gl.RGBA;
-                const width = 1;
-                const height = 1;
-                const border = 0;
-                const srcFormat = gl.RGBA;
-                const srcType = gl.UNSIGNED_BYTE;
-                const pixel = new Uint8Array([0, 125, 255, 255]);
-                gl.texImage2D(gl.TEXTURE_2D, level, internalFormat,
-                width, height, border, srcFormat, srcType,
-                pixel);
-
-                const image = new Image();
-                image.onload = function() 
-                {
-                    gl.bindTexture(gl.TEXTURE_2D, texture);
-                    gl.texImage2D(gl.TEXTURE_2D, level, internalFormat,
-                                srcFormat, srcType, image);
-                    if (isPowerOf2(image.width) && isPowerOf2(image.height)) 
-                    {
-                        gl.generateMipmap(gl.TEXTURE_2D);
-                    } 
-                    else 
-                    {
-                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-                    }
-                };
-                image.src = url;
-
-                return texture;
+            function handleMouseDown(e) {
+                mouseDown = true;
+                mouseMoved = false;
+                mouseX = e.clientX;
+                mouseY = e.clientY;
             }
 
-            function isPowerOf2(value)
-            {
-                return (value & (value - 1)) == 0;
+            function handleMouseUp(e) {
+                mouseDown = false;
+                mouseClicked = !mouseMoved;
             }
 
-            function resizeCanvas(event)
-            {
-                if (canvas.width != canvas.clientWidth ||
-                    canvas.height != canvas.clientHeight)
-                {
-                    canvas.width = canvas.clientWidth;
-                    canvas.height = canvas.clientHeight;
-                    parameters.screenWidth = canvas.width;
-                    parameters.screenHeight = canvas.height;
-                    gl.viewport(0, 0, canvas.width, canvas.height);
+            function handleMouseMove(e) {
+                if (!mouseDown) return;
+                mouseMoved = true;
+                const deltaX = e.clientX - mouseX;
+                const deltaY = e.clientY - mouseY;
+                eyeCoordinate.theta += (deltaX / 10) / 180 * Math.PI;
+                eyeCoordinate.phi += (-deltaY / 10) / 180 * Math.PI;
+                mouseX = e.clientX;
+                mouseY = e.clientY;
+            }
+
+            function handleWheel(e) {
+                const newRadius = eyeCoordinate.radius + e.deltaY / 100.0;
+                if (newRadius > 0.0) {
+                    eyeCoordinate.radius = newRadius;
                 }
             }
 
-            function handleMouseDown(event)
-            {
-                mousedown = true;
-                mouseDownX = event.clientX;
-                mouseDownY = event.clientY;
+            canvas.addEventListener('mousedown', handleMouseDown);
+            canvas.addEventListener('mousemove', handleMouseMove);
+            canvas.addEventListener('mouseup', handleMouseUp);
+            canvas.addEventListener('wheel', handleWheel);
+            canvas.addEventListener('touchstart', (e) => handleMouseDown(e.touches[0]));
+            canvas.addEventListener('touchend', (e) => handleMouseUp(e.changedTouches[0]));
+            canvas.addEventListener('touchmove', (e) => {
+                handleMouseMove(e.touches[0]);
+                e.preventDefault();
+            }, { passive: false });
+
+            function updateUniforms(screen) {
+                const now = performance.now();
+                const time = (now - startTime) / 1000;
+
+                const heightArray = new ArrayBuffer(64);
+                const heightFloats = new Float32Array(heightArray);
+                const heightUints = new Uint32Array(heightArray);
+                heightFloats[0] = simResolution;
+                heightFloats[1] = simResolution;
+                heightFloats[2] = time;
+                heightUints[3] = mouseClicked ? 1 : 0;
+                const dpr = window.devicePixelRatio || 1;
+                heightFloats[4] = mouseX * dpr;
+                heightFloats[5] = mouseY * dpr;
+                heightFloats[6] = screen.width;
+                heightFloats[7] = screen.height;
+                heightFloats[8] = eyeCoordinate.radius;
+                heightFloats[9] = eyeCoordinate.phi;
+                heightFloats[10] = eyeCoordinate.theta;
+                device.queue.writeBuffer(heightUniformBuffer, 0, heightArray);
+
+                const gravityArray = new Float32Array([simResolution, simResolution, 0, 0]);
+                device.queue.writeBuffer(gravityUniformBuffer, 0, gravityArray.buffer);
+
+                const causticsArray = new Float32Array(20);
+                causticsArray[0] = time;
+                causticsArray.set(lights[0], 4);
+                causticsArray.set(lights[1], 8);
+                causticsArray.set(lights[2], 12);
+                device.queue.writeBuffer(causticsUniformBuffer, 0, causticsArray.buffer);
+
+                const renderArray = new Float32Array(20);
+                renderArray[0] = screen.width;
+                renderArray[1] = screen.height;
+                renderArray[2] = time;
+                renderArray[4] = eyeCoordinate.radius;
+                renderArray[5] = eyeCoordinate.phi;
+                renderArray[6] = eyeCoordinate.theta;
+                renderArray.set(lights[0], 8);
+                renderArray.set(lights[1], 12);
+                renderArray.set(lights[2], 16);
+                device.queue.writeBuffer(renderUniformBuffer, 0, renderArray.buffer);
             }
 
-            function handleMouseUp(event)
-            {
-                mousedown = false;
-                mouseclicked = !mousemove;
-                mousemove = false
+            function draw() {
+                const screen = resizeCanvas();
+                updateUniforms(screen);
+
+                const commandEncoder = device.createCommandEncoder();
+
+                const heightPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: heightTexture0.createView(),
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+                    }]
+                });
+                heightPass.setPipeline(heightPipeline);
+                heightPass.setBindGroup(0, heightBindGroup);
+                heightPass.setVertexBuffer(0, quadBuffer);
+                heightPass.draw(6, 1, 0, 0);
+                heightPass.end();
+
+                const gravityPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: heightTexture1.createView(),
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+                    }]
+                });
+                gravityPass.setPipeline(gravityPipeline);
+                gravityPass.setBindGroup(0, gravityBindGroup);
+                gravityPass.setVertexBuffer(0, quadBuffer);
+                gravityPass.draw(6, 1, 0, 0);
+                gravityPass.end();
+
+                const causticsPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: causticsTexture.createView(),
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+                    }]
+                });
+                causticsPass.setPipeline(causticsPipeline);
+                causticsPass.setBindGroup(0, causticsBindGroup);
+                causticsPass.setVertexBuffer(0, lightWaveBuffer);
+                causticsPass.draw(lightWaveVertices.length / 2, 1, 0, 0);
+                causticsPass.end();
+
+                const renderPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: context.getCurrentTexture().createView(),
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                        clearValue: { r: 0, g: 0, b: 0, a: 1 }
+                    }]
+                });
+                renderPass.setPipeline(renderPipeline);
+                renderPass.setBindGroup(0, renderBindGroup);
+                renderPass.setVertexBuffer(0, quadBuffer);
+                renderPass.draw(6, 1, 0, 0);
+                renderPass.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+                mouseClicked = false;
+                requestAnimationFrame(draw);
             }
 
-            function handleMouseMove(event)
-            {
-                if (!mousedown)
-                {
-                    return;
-                }
-                mousemove = true;
-                var currentX = event.clientX;
-                var currentY = event.clientY;
-                var deltaX = currentX - mouseDownX;
-                var deltaY = currentY - mouseDownY;
-                eyeCoordinate.theta += (deltaX/10)/180 * Math.PI;
-                eyeCoordinate.phi += (-deltaY/10)/180 * Math.PI; 
-
-                mouseDownY = currentY;
-                mouseDownX = currentX;
-            }
-
-            function handleWheelScroll(event)
-            {
-                var new_radius = eyeCoordinate.radius + event.deltaY/100.0;
-                if (new_radius > 0.0)
-                {
-                    eyeCoordinate.radius = new_radius;
-                }
-            }
-
-            function animate()
-            {
-                resizeCanvas();
-                render();
-                requestAnimationFrame(animate);
-            }
-
-            function render()
-            {
-                if (!renderProgram) return;
-                parameters.time = new Date().getTime() - parameters.start_time;
-                gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-                // First Draw Call: Compute Height Field
-                gl.useProgram(heightProgram);
-                // Set which buffer to write to
-                gl.bindFramebuffer(gl.FRAMEBUFFER, heightFrameBuffer0);
-                // Set which texture to read from
-                gl.activeTexture(gl.TEXTURE0);
-                gl.bindTexture(gl.TEXTURE_2D, heightTexture1);
-
-                gl.viewport(0, 0, heightFrameBuffer0.width, heightFrameBuffer0.height);
-                gl.uniform1f(heightUniforms.timeLocation, parameters.time / 1000);
-                gl.uniform2f(heightUniforms.resolutionLocation, heightFrameBuffer0.width, heightFrameBuffer0.height);
-                gl.uniform1i(heightUniforms.samplerLocation, 0);
-                gl.uniform1i(heightUniforms.mouseHit, mouseclicked);
-                gl.uniform2f(heightUniforms.mousePos, mouseDownX, mouseDownY);
-                gl.uniform3f(heightUniforms.eyeCoordinate, eyeCoordinate.radius, eyeCoordinate.phi, eyeCoordinate.theta);
-                gl.uniform2f(heightUniforms.screenRes, parameters.screenWidth, parameters.screenHeight);
-
-                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-                gl.vertexAttribPointer(vertex_position, 2, gl.FLOAT, false, 0, 0);
-                gl.enableVertexAttribArray(vertex_position);
-                gl.drawArrays(gl.TRIANGLES, 0, 6);
-                gl.disableVertexAttribArray(vertex_position);
-
-                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-                mouseclicked = false; // once per click
-
-                // Second Draw Call: Gravity
-                gl.useProgram(gravityProgram);
-                
-                // write
-                gl.bindFramebuffer(gl.FRAMEBUFFER, heightFrameBuffer1);
-                
-                // read
-                gl.activeTexture(gl.TEXTURE1);
-                gl.bindTexture(gl.TEXTURE_2D, null);
-                gl.activeTexture(gl.TEXTURE0);
-                gl.bindTexture(gl.TEXTURE_2D, heightTexture0);
-
-                gl.viewport(0, 0, heightFrameBuffer0.width, heightFrameBuffer0.height);
-                gl.uniform2f(gravityUniforms.resolutionLocation, heightFrameBuffer0.width, heightFrameBuffer0.height);
-                gl.uniform1i(gravityUniforms.samplerLocation, 0);
-
-                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-                gl.vertexAttribPointer(vertex_position, 2, gl.FLOAT, false, 0, 0);
-                gl.enableVertexAttribArray(vertex_position);
-                gl.drawArrays(gl.TRIANGLES, 0, 6);
-                gl.disableVertexAttribArray(vertex_position);
-                
-                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-                // Third Draw Call: Caustics
-                gl.useProgram(causticsProgram);
-
-                gl.bindFramebuffer(gl.FRAMEBUFFER, causticsFrameBuffer);
-                gl.viewport(0, 0, causticsFrameBuffer.width, causticsFrameBuffer.height);
-
-                gl.activeTexture(gl.TEXTURE0);
-                gl.bindTexture(gl.TEXTURE_2D, heightTexture1);
-
-                gl.uniform1f(causticsUniform.timeLocation, parameters.time / 1000);
-                gl.uniform1i(causticsUniform.heightSamplerLocation, 0);
-                gl.uniform3f(causticsUniform.light1, 2.0, 2.0, 2.0)
-                gl.uniform3f(causticsUniform.light2, -2.0, 2.0, -2.0);
-                gl.uniform3f(causticsUniform.light3, 0.0, 2.0, 0.0);
-
-                gl.bindBuffer(gl.ARRAY_BUFFER, lightWaveBuffer);
-                gl.vertexAttribPointer(vertex_position, 2, gl.FLOAT, false, 0, 0);
-                gl.enableVertexAttribArray(vertex_position);
-                gl.drawArrays(gl.TRIANGLES, 0, lightWaveVertices.length/2);
-                gl.disableVertexAttribArray(vertex_position);
-
-                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-                // Fourth Draw Call: Render
-                gl.useProgram(renderProgram);
-
-                gl.activeTexture(gl.TEXTURE0);
-                gl.bindTexture(gl.TEXTURE_2D, heightTexture1);
-                gl.activeTexture(gl.TEXTURE1);
-                gl.bindTexture(gl.TEXTURE_2D, wallTexture);
-                gl.activeTexture(gl.TEXTURE2);
-                gl.bindTexture(gl.TEXTURE_2D, causticsTexture);
-                gl.activeTexture(gl.TEXTURE3);
-                gl.bindTexture(gl.TEXTURE_2D, skyTexture);
-                
-                gl.viewport(0, 0, parameters.screenWidth, parameters.screenHeight);
-
-                // Set values to program variables
-                gl.uniform1f(renderUniforms.timeLocation, parameters.time / 1000);
-                gl.uniform2f(renderUniforms.resolutionLocation, parameters.screenWidth, parameters.screenHeight);
-                gl.uniform1i(renderUniforms.heightSamplerLocation, 0);
-                gl.uniform1i(renderUniforms.wallSamplerLocation, 1);
-                gl.uniform1i(renderUniforms.causticsSamperLocation, 2);
-                gl.uniform1i(renderUniforms.skySamplerLocation, 3);
-                gl.uniform3f(renderUniforms.eyeCoordinate, eyeCoordinate.radius, eyeCoordinate.phi, eyeCoordinate.theta);
-                gl.uniform3f(renderUniforms.light1, 2.0, 2.0, 2.0);
-                gl.uniform3f(renderUniforms.light2, -2.0, 2.0, -2.0);
-                gl.uniform3f(renderUniforms.light3, 0.0, 2.0, 0.0);
-
-                // Render geometry
-                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-                gl.vertexAttribPointer(vertex_position, 2, gl.FLOAT, false, 0, 0);
-                gl.enableVertexAttribArray(vertex_position);
-                gl.drawArrays(gl.TRIANGLES, 0, 6);
-                gl.disableVertexAttribArray(vertex_position);
-
-                frame = (frame + 1) % 2;
-            }
-
+            draw();
+        })();
     </script>
 </body>
 </html>
