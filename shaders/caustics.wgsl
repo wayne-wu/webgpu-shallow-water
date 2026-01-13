@@ -5,19 +5,14 @@ const AIR_IOR: f32 = 1.0;
 const WATER_IOR: f32 = 1.33;
 
 struct CausticsUniforms {
-    time: f32,
-    padding0: vec3<f32>,
-    light1: vec3<f32>,
-    padding1: f32,
-    light2: vec3<f32>,
-    padding2: f32,
-    light3: vec3<f32>,
-    padding3: f32,
+    params0: vec4<f32>, // time, heightRes.x, heightRes.y, causticsRes.x
+    params1: vec4<f32>, // causticsRes.y, light1.xyz
+    params2: vec4<f32>, // light2.xyz, padding
+    params3: vec4<f32>, // light3.xyz, padding
 };
 
 @group(0) @binding(0) var<uniform> uniforms: CausticsUniforms;
-@group(0) @binding(1) var heightSampler: sampler;
-@group(0) @binding(2) var heightTexture: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read> heightData: array<vec4<f32>>;
 
 struct VSOut {
     @builtin(position) position: vec4<f32>,
@@ -32,13 +27,39 @@ fn distBox(p: vec3<f32>) -> f32 {
 }
 
 fn sinusoid(x: f32, z: f32) -> f32 {
-    let t = x * x * sin(uniforms.time) + z * z * sin(uniforms.time);
+    let t = x * x * sin(uniforms.params0.x) + z * z * sin(uniforms.params0.x);
     return AMP * (sin(FREQ * t) - cos((FREQ * 0.5) * t));
+}
+
+fn heightAtUV(uv: vec2<f32>) -> f32 {
+    let res = uniforms.params0.yz;
+    let resX = u32(res.x);
+    let resY = u32(res.y);
+    let uvClamped = clamp(uv, vec2<f32>(0.0), vec2<f32>(0.999999));
+    let fx = uvClamped.x * (res.x - 1.0);
+    let fz = uvClamped.y * (res.y - 1.0);
+    let x0 = u32(floor(fx));
+    let z0 = u32(floor(fz));
+    let x1 = min(x0 + 1u, resX - 1u);
+    let z1 = min(z0 + 1u, resY - 1u);
+    let tx = fx - f32(x0);
+    let tz = fz - f32(z0);
+    let i00 = z0 * resX + x0;
+    let i10 = z0 * resX + x1;
+    let i01 = z1 * resX + x0;
+    let i11 = z1 * resX + x1;
+    let h00 = heightData[i00].z;
+    let h10 = heightData[i10].z;
+    let h01 = heightData[i01].z;
+    let h11 = heightData[i11].z;
+    let hx0 = mix(h00, h10, tx);
+    let hx1 = mix(h01, h11, tx);
+    return mix(hx0, hx1, tz);
 }
 
 fn height(x: f32, z: f32) -> f32 {
     let uv = (vec2<f32>(x, z) + vec2<f32>(1.0, 1.0)) * 0.5;
-    return textureSampleLevel(heightTexture, heightSampler, uv, 0.0).z;
+    return heightAtUV(uv);
 }
 
 fn getSurfaceNormal(p: vec3<f32>) -> vec3<f32> {
@@ -98,10 +119,10 @@ fn getArea(pos: vec3<f32>) -> f32 {
 fn vs_main(@location(0) position: vec2<f32>) -> VSOut {
     var out: VSOut;
     out.position = vec4<f32>(position, 0.0, 1.0);
-    let worldSpacePos = vec3<f32>(position.x, 0.0, position.y);
-    out.startPos = remapCoordinate(worldSpacePos, uniforms.light3).xzy;
-    out.endPos = getEndPos(out.startPos, uniforms.light3).xzy;
-    out.startPos = out.startPos.xzy;
+    let worldSpacePos = vec3<f32>(position.x, 0.0, -position.y);
+    let lightPos = uniforms.params3.xyz;
+    out.startPos = remapCoordinate(worldSpacePos, lightPos);
+    out.endPos = getEndPos(out.startPos, lightPos);
     return out;
 }
 
@@ -109,5 +130,6 @@ fn vs_main(@location(0) position: vec2<f32>) -> VSOut {
 fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
     let startArea = max(getArea(input.startPos), 1e-5);
     let endArea = max(getArea(input.endPos), 1e-5);
-    return vec4<f32>(startArea / endArea, 1.0, 1.0, 1.0);
+    let ratio = startArea / endArea;
+    return vec4<f32>(ratio, 1.0, 1.0, 1.0);
 }
