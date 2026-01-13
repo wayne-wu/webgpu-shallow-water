@@ -7,8 +7,8 @@ const WATER_IOR: f32 = 1.33;
 struct CausticsUniforms {
     params0: vec4<f32>, // time, heightRes.x, heightRes.y, causticsRes.x
     params1: vec4<f32>, // causticsRes.y, light1.xyz
-    params2: vec4<f32>, // light2.xyz, padding
-    params3: vec4<f32>, // light3.xyz, padding
+    params2: vec4<f32>, // light2.xyz, threshold
+    params3: vec4<f32>, // light3.xyz, gain
 };
 
 @group(0) @binding(0) var<uniform> uniforms: CausticsUniforms;
@@ -115,6 +115,10 @@ fn getArea(pos: vec3<f32>) -> f32 {
     return length(dpdx(pos)) * length(dpdy(pos));
 }
 
+fn getBias(t: f32, b: f32) -> f32 {
+    return (t / ((1.0 / b - 2.0) * (1.0 - t) + 1.0));
+}
+
 @vertex
 fn vs_main(@location(0) position: vec2<f32>) -> VSOut {
     var out: VSOut;
@@ -131,5 +135,6 @@ fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
     let startArea = max(getArea(input.startPos), 1e-5);
     let endArea = max(getArea(input.endPos), 1e-5);
     let ratio = startArea / endArea;
-    return vec4<f32>(ratio, 1.0, 1.0, 1.0);
+    let intensity = getBias(ratio, uniforms.params3.w);
+    return vec4<f32>(intensity, intensity, intensity, 1.0);
 }

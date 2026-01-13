@@ -1,8 +1,9 @@
 import Stats from 'three/examples/jsm/libs/stats.module.js';
 
 const eyeCoordinate = { radius: 3.5, phi: 0.8, theta: 0.8 };
-const lightPos = [ 2.0, 3.0, 2.0 ];
-const HEIGHT_RES = 512;
+const lightPos = [ 0.0, 3.0, 0.0 ];
+const HEIGHT_RES = 256;
+const CAUSTICS_SIZE = 512;
 const BOUNDS = 2.0;
 const BOUNDS_HALF = BOUNDS * 0.5;
 
@@ -14,7 +15,10 @@ const effectController = {
     viscosity: 0.995,
     speed: 10,
     causticsEnabled: true,
-    causticsDebug: false
+    causticsDebug: false,
+    causticsBlurEnabled: true,
+    causticsThreshold: 0.2,
+    causticsGain: 0.3
 };
 
 let canvas;
@@ -25,18 +29,23 @@ let maxTextureSize = 8192;
 let heightPipeline;
 let copyPipeline;
 let causticsPipeline;
+let blurPipeline;
 let renderPipeline;
 let heightUniformBuffer;
 let copyUniformBuffer;
 let causticsUniformBuffer;
+let blurUniformBuffer;
 let renderUniformBuffer;
 let heightBindGroup;
 let copyBindGroup;
 let causticsBindGroup;
+let blurBindGroupH;
+let blurBindGroupV;
 let renderBindGroup;
 let heightBuffer0;
 let heightBuffer1;
 let causticsTexture;
+let causticsBlurTexture;
 let linearSampler;
 let quadBuffer;
 let lightWaveBuffer;
@@ -277,17 +286,19 @@ function updateUniforms( screen ) {
     causticsArray[ 0 ] = time;
     causticsArray[ 1 ] = HEIGHT_RES;
     causticsArray[ 2 ] = HEIGHT_RES;
-    causticsArray[ 3 ] = 512;
-    causticsArray[ 4 ] = 512;
+    causticsArray[ 3 ] = CAUSTICS_SIZE;
+    causticsArray[ 4 ] = CAUSTICS_SIZE;
     causticsArray[ 5 ] = lightPos[ 0 ];
     causticsArray[ 6 ] = lightPos[ 1 ];
     causticsArray[ 7 ] = lightPos[ 2 ];
     causticsArray[ 8 ] = lightPos[ 0 ];
     causticsArray[ 9 ] = lightPos[ 1 ];
     causticsArray[ 10 ] = lightPos[ 2 ];
+    causticsArray[ 11 ] = effectController.causticsThreshold;
     causticsArray[ 12 ] = lightPos[ 0 ];
     causticsArray[ 13 ] = lightPos[ 1 ];
     causticsArray[ 14 ] = lightPos[ 2 ];
+    causticsArray[ 15 ] = effectController.causticsGain;
     device.queue.writeBuffer( causticsUniformBuffer, 0, causticsArray.buffer );
 
 }
@@ -316,8 +327,12 @@ async function init() {
     gui.add( effectController, 'mouseSize', 0.02, 0.5, 0.01 );
     gui.add( effectController, 'viscosity', 0.9, 0.999, 0.001 );
     gui.add( effectController, 'speed', 1, 20, 1 );
-    gui.add( effectController, 'causticsEnabled' );
-    gui.add( effectController, 'causticsDebug' );
+    const causticsFolder = gui.addFolder( 'Caustics' );
+    causticsFolder.add( effectController, 'causticsEnabled' );
+    causticsFolder.add( effectController, 'causticsDebug' );
+    causticsFolder.add( effectController, 'causticsBlurEnabled' );
+    causticsFolder.add( effectController, 'causticsThreshold', 0.0, 1.0, 0.01 );
+    causticsFolder.add( effectController, 'causticsGain', 0.0, 1.0, 0.01 );
     gui.add( { resetWater: () => {
         if ( ! resetHeightData ) return;
         device.queue.writeBuffer( heightBuffer0, 0, resetHeightData );
@@ -342,7 +357,8 @@ async function init() {
         render: 'shaders/render.wgsl',
         height: 'shaders/heightfield.wgsl',
         copy: 'shaders/heightfield-copy.wgsl',
-        caustics: 'shaders/caustics.wgsl'
+        caustics: 'shaders/caustics.wgsl',
+        blur: 'shaders/blur.wgsl'
     };
     const shaders = {};
     await Promise.all( Object.keys( shaderPaths ).map( async ( key ) => {
@@ -370,6 +386,7 @@ async function init() {
     const heightModule = device.createShaderModule( { code: shaders.height } );
     const copyModule = device.createShaderModule( { code: shaders.copy } );
     const causticsModule = device.createShaderModule( { code: shaders.caustics } );
+    const blurModule = device.createShaderModule( { code: shaders.blur } );
     const vertexBufferLayout = {
         arrayStride: 8,
         attributes: [ { shaderLocation: 0, offset: 0, format: 'float32x2' } ]
@@ -407,6 +424,11 @@ async function init() {
         compute: { module: copyModule, entryPoint: 'cs_main' }
     } );
 
+    blurPipeline = device.createComputePipeline( {
+        layout: 'auto',
+        compute: { module: blurModule, entryPoint: 'cs_main' }
+    } );
+
     const heightData = new Float32Array( HEIGHT_RES * HEIGHT_RES * 4 );
     for ( let y = 0; y < HEIGHT_RES; y ++ ) {
         for ( let x = 0; x < HEIGHT_RES; x ++ ) {
@@ -441,6 +463,10 @@ async function init() {
         size: 64,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     } );
+    blurUniformBuffer = device.createBuffer( {
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    } );
 
     renderUniformBuffer = device.createBuffer( {
         size: 64,
@@ -455,16 +481,21 @@ async function init() {
     } );
 
     causticsTexture = device.createTexture( {
-        size: [ 512, 512, 1 ],
+        size: [ CAUSTICS_SIZE, CAUSTICS_SIZE, 1 ],
         format: 'rgba16float',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING
+    } );
+    causticsBlurTexture = device.createTexture( {
+        size: [ CAUSTICS_SIZE, CAUSTICS_SIZE, 1 ],
+        format: 'rgba16float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
     } );
 
-    const causticsSeed = new Float32Array( 512 * 512 * 4 );
-    for ( let y = 0; y < 512; y ++ ) {
-        for ( let x = 0; x < 512; x ++ ) {
-            const index = ( y * 512 + x ) * 4;
-            causticsSeed[ index + 0 ] = x / 511;
+    const causticsSeed = new Float32Array( CAUSTICS_SIZE * CAUSTICS_SIZE * 4 );
+    for ( let y = 0; y < CAUSTICS_SIZE; y ++ ) {
+        for ( let x = 0; x < CAUSTICS_SIZE; x ++ ) {
+            const index = ( y * CAUSTICS_SIZE + x ) * 4;
+            causticsSeed[ index + 0 ] = x / ( CAUSTICS_SIZE - 1 );
             causticsSeed[ index + 1 ] = 0.0;
             causticsSeed[ index + 2 ] = 0.0;
             causticsSeed[ index + 3 ] = 1.0;
@@ -473,8 +504,8 @@ async function init() {
     device.queue.writeTexture(
         { texture: causticsTexture },
         causticsSeed,
-        { bytesPerRow: 512 * 8, rowsPerImage: 512 },
-        { width: 512, height: 512, depthOrArrayLayers: 1 }
+        { bytesPerRow: CAUSTICS_SIZE * 8, rowsPerImage: CAUSTICS_SIZE },
+        { width: CAUSTICS_SIZE, height: CAUSTICS_SIZE, depthOrArrayLayers: 1 }
     );
 
     heightBindGroup = device.createBindGroup( {
@@ -500,6 +531,26 @@ async function init() {
         entries: [
             { binding: 0, resource: { buffer: causticsUniformBuffer } },
             { binding: 1, resource: { buffer: heightBuffer0 } }
+        ]
+    } );
+
+    blurBindGroupH = device.createBindGroup( {
+        layout: blurPipeline.getBindGroupLayout( 0 ),
+        entries: [
+            { binding: 0, resource: linearSampler },
+            { binding: 1, resource: causticsTexture.createView() },
+            { binding: 2, resource: causticsBlurTexture.createView() },
+            { binding: 3, resource: { buffer: blurUniformBuffer } }
+        ]
+    } );
+
+    blurBindGroupV = device.createBindGroup( {
+        layout: blurPipeline.getBindGroupLayout( 0 ),
+        entries: [
+            { binding: 0, resource: linearSampler },
+            { binding: 1, resource: causticsBlurTexture.createView() },
+            { binding: 2, resource: causticsTexture.createView() },
+            { binding: 3, resource: { buffer: blurUniformBuffer } }
         ]
     } );
 
@@ -610,6 +661,26 @@ function draw() {
     causticsPass.setVertexBuffer( 0, lightWaveBuffer );
     causticsPass.draw( lightWaveVertexCount, 1, 0, 0 );
     causticsPass.end();
+
+    if ( effectController.causticsBlurEnabled ) {
+        const blurArray = new Float32Array( [ CAUSTICS_SIZE, CAUSTICS_SIZE, 1.0, 0.0 ] );
+        device.queue.writeBuffer( blurUniformBuffer, 0, blurArray.buffer );
+        const blurWorkgroups = Math.ceil( CAUSTICS_SIZE / 8 );
+        const blurPassH = commandEncoder.beginComputePass();
+        blurPassH.setPipeline( blurPipeline );
+        blurPassH.setBindGroup( 0, blurBindGroupH );
+        blurPassH.dispatchWorkgroups( blurWorkgroups, blurWorkgroups );
+        blurPassH.end();
+
+        blurArray[ 2 ] = 0.0;
+        blurArray[ 3 ] = 1.0;
+        device.queue.writeBuffer( blurUniformBuffer, 0, blurArray.buffer );
+        const blurPassV = commandEncoder.beginComputePass();
+        blurPassV.setPipeline( blurPipeline );
+        blurPassV.setBindGroup( 0, blurBindGroupV );
+        blurPassV.dispatchWorkgroups( blurWorkgroups, blurWorkgroups );
+        blurPassV.end();
+    }
 
     const renderPass = commandEncoder.beginRenderPass( {
         colorAttachments: [ {

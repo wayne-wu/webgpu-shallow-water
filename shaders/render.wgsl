@@ -3,6 +3,7 @@ const MAX_STEPS: u32 = 128u;
 const SURFACE_STEPS: u32 = 256u;
 const MAX_DIST: f32 = 20.0;
 const TANK_HEIGHT: f32 = 0.5;
+const SURFACE_EDGE: f32 = 1.01;
 const AIR_IOR: f32 = 1.0;
 const WATER_IOR: f32 = 1.33;
 const WATER_TINT: vec3<f32> = vec3<f32>(0.1, 0.45, 0.65);
@@ -159,7 +160,7 @@ fn hitHeightfield(eye: vec3<f32>, dir: vec3<f32>) -> HitInfo {
         if (t > MAX_DIST) {
             break;
         }
-        if (abs(p.x) > 1.0 || abs(p.z) > 1.0 || p.y < -TANK_HEIGHT || p.y > 1.0) {
+        if (abs(p.x) > SURFACE_EDGE || abs(p.z) > SURFACE_EDGE || p.y < -TANK_HEIGHT || p.y > 1.0) {
             t = t + step;
             continue;
         }
@@ -195,6 +196,34 @@ fn shade(pos: vec3<f32>, normal: vec3<f32>, baseColor: vec3<f32>) -> vec4<f32> {
     let diff = max(dot(normal, lightDir), 0.0);
     let color = baseColor * (0.2 + 0.8 * diff);
     return vec4<f32>(color, 1.0);
+}
+
+fn shadeWithCaustics(pos: vec3<f32>, normal: vec3<f32>, baseColor: vec3<f32>) -> vec3<f32> {
+    let caustics = getCaustics(pos);
+    var color = shade(pos, normal, baseColor).rgb;
+    let causticTint = vec3<f32>(1.0, 0.9, 0.6) * caustics;
+    return mix(color, color + causticTint, 0.4);
+}
+
+fn shadeSide(dir: vec3<f32>, hit: HitInfo) -> vec3<f32> {
+    var eta = AIR_IOR / WATER_IOR;
+    let refrDir = refractDir(dir, hit.normal, eta);
+    let innerStart = hit.position + refrDir * (EPS * 4.0);
+    let innerFloorHit = planeHit(innerStart, refrDir, -TANK_HEIGHT);
+    let cosTheta = clamp(dot(-dir, hit.normal), 0.0, 1.0);
+    eta = (AIR_IOR - WATER_IOR) / (AIR_IOR + WATER_IOR);
+    let f0 = eta * eta;
+    let fresnel = fresnelSchlick(cosTheta, f0);
+    let reflectColor = vec3<f32>(0.9, 0.9, 0.95);
+
+    var refracted = WATER_TINT;
+    if (innerFloorHit.hit == 1u) {
+        let base = checkerboard(innerFloorHit.position);
+        let color = shadeWithCaustics(innerFloorHit.position, innerFloorHit.normal, base);
+        refracted = applyAbsorption(color, innerFloorHit.t);
+    }
+
+    return mix(refracted, reflectColor, fresnel);
 }
 
 fn getCaustics(p: vec3<f32>) -> f32 {
@@ -244,6 +273,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let imagePos = eye + right * u + up * v + forward * 2.0;
     let dir = normalize(imagePos - eye);
 
+    let background = vec4<f32>(0.9, 0.9, 0.95, 1.0);
+
     let surfaceHit = hitHeightfield(eye, dir);
     let boxHit = raymarchBox(eye, dir);
     let floorHit = planeHit(eye, dir, -TANK_HEIGHT);
@@ -252,7 +283,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let boxIsSide = boxHit.hit == 1u &&
         abs(boxHit.normal.y) < 0.5 &&
         boxHit.position.y <= sideHeight + EPS;
-    if (surfaceHit.hit == 1u && (floorHit.hit == 0u || surfaceHit.t < floorHit.t) && (!boxIsSide || surfaceHit.t < boxHit.t)) {
+    let surfaceInBounds = max(abs(surfaceHit.position.x), abs(surfaceHit.position.z)) <= SURFACE_EDGE;
+    if (surfaceHit.hit == 1u && surfaceInBounds && (floorHit.hit == 0u || surfaceHit.t < floorHit.t) && (!boxIsSide || surfaceHit.t < boxHit.t)) {
         var eta = AIR_IOR / WATER_IOR;
         let refrDir = refractDir(dir, surfaceHit.normal, eta);
         let innerStart = surfaceHit.position + refrDir * (EPS * 4.0);
@@ -266,10 +298,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         var refracted = WATER_TINT;
         if (innerFloorHit.hit == 1u) {
             let base = checkerboard(innerFloorHit.position);
-            let caustics = getCaustics(innerFloorHit.position);
-            var color = shade(innerFloorHit.position, innerFloorHit.normal, base).rgb;
-            let causticTint = vec3<f32>(1.0, 0.9, 0.6) * caustics;
-            color = mix(color, color + causticTint, 0.35);
+            let color = shadeWithCaustics(innerFloorHit.position, innerFloorHit.normal, base);
             let travel = innerFloorHit.t;
             refracted = applyAbsorption(color, travel);
         }
@@ -279,46 +308,23 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         let surfaceLit = shade(surfaceHit.position, surfaceHit.normal, surfaceTint).rgb;
         let mixed = mix(refracted, reflectColor, fresnel);
         var finalColor = mix(mixed, surfaceLit, 0.2);
-        let edge = 1.0 - max(abs(surfaceHit.position.x), abs(surfaceHit.position.z));
-        let feather = smoothstep(0.0, 0.03, edge);
-        let background = vec3<f32>(0.9, 0.9, 0.95);
-        finalColor = mix(background, finalColor, feather);
+        let edge = SURFACE_EDGE - max(abs(surfaceHit.position.x), abs(surfaceHit.position.z));
+        let feather = smoothstep(0.0, 0.02, edge);
+        let edgeTarget = select(background.xyz, shadeSide(dir, boxHit), boxHit.hit == 1u && abs(boxHit.normal.y) < 0.5);
+        finalColor = mix(edgeTarget, finalColor, feather);
         return vec4<f32>(finalColor, 1.0);
     }
 
     if (boxIsSide && (floorHit.hit == 0u || boxHit.t < floorHit.t)) {
-        var eta = AIR_IOR / WATER_IOR;
-        let refrDir = refractDir(dir, boxHit.normal, eta);
-        let innerStart = boxHit.position + refrDir * (EPS * 4.0);
-        let innerFloorHit = planeHit(innerStart, refrDir, -TANK_HEIGHT);
-        let cosTheta = clamp(dot(-dir, boxHit.normal), 0.0, 1.0);
-        eta = (AIR_IOR - WATER_IOR) / (AIR_IOR + WATER_IOR);
-        let f0 = eta * eta;
-        let fresnel = fresnelSchlick(cosTheta, f0);
-        let reflectColor = vec3<f32>(0.9, 0.9, 0.95);
-
-        var refracted = WATER_TINT;
-        if (innerFloorHit.hit == 1u) {
-            let base = checkerboard(innerFloorHit.position);
-            let caustics = getCaustics(innerFloorHit.position);
-            var color = shade(innerFloorHit.position, innerFloorHit.normal, base).rgb;
-            let causticTint = vec3<f32>(1.0, 0.9, 0.6) * caustics;
-            color = mix(color, color + causticTint, 0.35);
-            refracted = applyAbsorption(color, innerFloorHit.t);
-        }
-
-        let mixed = mix(refracted, reflectColor, fresnel);
+        let mixed = shadeSide(dir, boxHit);
         return vec4<f32>(mixed, 1.0);
     }
 
     if (floorHit.hit == 1u) {
         let base = checkerboard(floorHit.position);
-        let caustics = getCaustics(floorHit.position);
-        var color = shade(floorHit.position, floorHit.normal, base).rgb;
-        let causticTint = vec3<f32>(1.0, 0.9, 0.6) * caustics;
-        color = mix(color, color + causticTint, 0.35);
+        let color = shadeWithCaustics(floorHit.position, floorHit.normal, base);
         return vec4<f32>(color, 1.0);
     }
 
-    return vec4<f32>(0.9, 0.9, 0.95, 1.0);
+    return background;
 }
