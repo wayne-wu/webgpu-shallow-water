@@ -42,31 +42,36 @@ fn distBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
     return min(max(d.x, max(d.y, d.z)), 0.0) + length(max(d, vec3<f32>(0.0, 0.0, 0.0)));
 }
 
-fn boxNormal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec3<f32>(EPS, 0.0, 0.0);
-    let d = vec3<f32>(
-        distBox(p + e.xyy, vec3<f32>(1.0, TANK_HEIGHT, 1.0)) - distBox(p - e.xyy, vec3<f32>(1.0, TANK_HEIGHT, 1.0)),
-        distBox(p + e.yxy, vec3<f32>(1.0, TANK_HEIGHT, 1.0)) - distBox(p - e.yxy, vec3<f32>(1.0, TANK_HEIGHT, 1.0)),
-        distBox(p + e.yyx, vec3<f32>(1.0, TANK_HEIGHT, 1.0)) - distBox(p - e.yyx, vec3<f32>(1.0, TANK_HEIGHT, 1.0))
-    );
-    return normalize(d);
+fn rayAABB(eye: vec3<f32>, dir: vec3<f32>, bounds: vec3<f32>) -> HitInfo {
+    let invDir = 1.0 / dir;
+    let t0 = (-bounds - eye) * invDir;
+    let t1 = (bounds - eye) * invDir;
+    let tmin = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let tmax = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    if (tmax < 0.0 || tmin > tmax) {
+        return HitInfo(0u, tmax, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+    }
+    let t = select(tmax, tmin, tmin > 0.0);
+    let p = eye + dir * t;
+    let absP = abs(p);
+    var n = vec3<f32>(0.0, 1.0, 0.0);
+    if (absP.x >= absP.y && absP.x >= absP.z) {
+        n = vec3<f32>(sign(p.x), 0.0, 0.0);
+    } else if (absP.y >= absP.x && absP.y >= absP.z) {
+        n = vec3<f32>(0.0, sign(p.y), 0.0);
+    } else {
+        n = vec3<f32>(0.0, 0.0, sign(p.z));
+    }
+    return HitInfo(1u, t, p, n);
 }
 
-fn raymarchBox(eye: vec3<f32>, dir: vec3<f32>) -> HitInfo {
-    var t = 0.0;
-    let bounds = vec3<f32>(1.0, TANK_HEIGHT, 1.0);
-    for (var i: u32 = 0u; i < MAX_STEPS; i = i + 1u) {
-        let p = eye + dir * t;
-        let d = distBox(p, bounds);
-        if (d < EPS) {
-            return HitInfo(1u, t, p, boxNormal(p));
-        }
-        t = t + d;
-        if (t > MAX_DIST) {
-            break;
-        }
-    }
-    return HitInfo(0u, t, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+fn rayAABBInterval(eye: vec3<f32>, dir: vec3<f32>, bounds: vec3<f32>) -> vec2<f32> {
+    let invDir = 1.0 / dir;
+    let t0 = (-bounds - eye) * invDir;
+    let t1 = (bounds - eye) * invDir;
+    let tmin = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let tmax = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return vec2<f32>(tmin, tmax);
 }
 
 fn planeHit(eye: vec3<f32>, dir: vec3<f32>, planeY: f32) -> HitInfo {
@@ -150,12 +155,19 @@ fn surfaceNormal(p: vec3<f32>) -> vec3<f32> {
 }
 
 fn hitHeightfield(eye: vec3<f32>, dir: vec3<f32>) -> HitInfo {
-    let step = 0.02;
-    var t = 0.0;
+    let interval = rayAABBInterval(eye, dir, vec3<f32>(1.0, TANK_HEIGHT, 1.0));
+    if (interval.y < 0.0 || interval.x > interval.y) {
+        return HitInfo(0u, 0.0, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+    }
+    var t = max(interval.x, 0.0);
+    let tEnd = interval.y;
+    let coarseSteps = 32u;
+    let step = max((tEnd - t) / f32(coarseSteps), 0.0005);
+    var prevT = t;
     var prevDiff = 0.0;
     var hasPrev = false;
 
-    for (var i: u32 = 0u; i < SURFACE_STEPS; i = i + 1u) {
+    for (var i: u32 = 0u; i < coarseSteps; i = i + 1u) {
         let p = eye + dir * t;
         if (t > MAX_DIST) {
             break;
@@ -167,22 +179,28 @@ fn hitHeightfield(eye: vec3<f32>, dir: vec3<f32>) -> HitInfo {
 
         let diff = p.y - heightAtPos(p);
         if (hasPrev && diff <= 0.0 && prevDiff > 0.0) {
-            var tLow = t - step;
-            var tHigh = t;
-            for (var j: u32 = 0u; j < 6u; j = j + 1u) {
-                let tMid = (tLow + tHigh) * 0.5;
-                let pMid = eye + dir * tMid;
-                let midDiff = pMid.y - heightAtPos(pMid);
-                if (midDiff > 0.0) {
-                    tLow = tMid;
+            var t0 = prevT;
+            var t1 = t;
+            var d0 = prevDiff;
+            var d1 = diff;
+            for (var j: u32 = 0u; j < 5u; j = j + 1u) {
+                let denom = max(abs(d1 - d0), 1e-5);
+                let t2 = clamp(t1 - d1 * (t1 - t0) / (d1 - d0), t0, t1);
+                let p2 = eye + dir * t2;
+                let d2 = p2.y - heightAtPos(p2);
+                if (d2 > 0.0) {
+                    t0 = t2;
+                    d0 = d2;
                 } else {
-                    tHigh = tMid;
+                    t1 = t2;
+                    d1 = d2;
                 }
             }
-            let pHit = eye + dir * tHigh;
-            return HitInfo(1u, tHigh, pHit, surfaceNormal(pHit));
+            let pHit = eye + dir * t1;
+            return HitInfo(1u, t1, pHit, surfaceNormal(pHit));
         }
 
+        prevT = t;
         prevDiff = diff;
         hasPrev = true;
         t = t + step;
@@ -276,7 +294,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let background = vec4<f32>(0.9, 0.9, 0.95, 1.0);
 
     let surfaceHit = hitHeightfield(eye, dir);
-    let boxHit = raymarchBox(eye, dir);
+    let boxHit = rayAABB(eye, dir, vec3<f32>(1.0, TANK_HEIGHT, 1.0));
     let floorHit = planeHit(eye, dir, -TANK_HEIGHT);
 
     let sideHeight = heightAtPos(boxHit.position);

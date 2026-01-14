@@ -2,7 +2,7 @@ import Stats from 'three/examples/jsm/libs/stats.module.js';
 
 const eyeCoordinate = { radius: 3.5, phi: 0.8, theta: 0.8 };
 const lightPos = [ 0.0, 3.0, 0.0 ];
-const HEIGHT_RES = 256;
+const HEIGHT_RES = 512;
 const CAUSTICS_SIZE = 512;
 const BOUNDS = 2.0;
 const BOUNDS_HALF = BOUNDS * 0.5;
